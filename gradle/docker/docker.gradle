@@ -284,7 +284,19 @@ project.afterEvaluate {
           if (extension.platforms.get()) {
             bake_spec_target.platforms = extension.platforms.get()
           } else {
-            bake_spec_target.platforms = extension.defaultPlatforms
+            // Optional: -PdockerBuildPlatforms=linux/amd64,linux/arm64 (comma-separated). Reduces CI time when
+            // only one arch is required (e.g. security scan on GitHub hosted amd64 runners).
+            def p = project.findProperty("dockerBuildPlatforms")
+            if (p != null) {
+              def pl = p.toString().split(",").collect { it.trim() }.findAll { !it.isEmpty() }
+              if (!pl.isEmpty()) {
+                bake_spec_target.platforms = pl
+              } else {
+                bake_spec_target.platforms = extension.defaultPlatforms
+              }
+            } else {
+              bake_spec_target.platforms = extension.defaultPlatforms
+            }
           }
         }
 
@@ -292,7 +304,21 @@ project.afterEvaluate {
           bake_spec_target.name = "${project.name}-\${variants.tagSuffix}"
           bake_spec_target.matrix = [variants: []]
 
+          // Optional: -PvariantSuffixAllowlist=,-slim,-locked-wolfi (comma-separated; empty segment = base tag)
+          // Limits the bake matrix when building a subset of variants (e.g. profile registry_variant_tag_suffixes).
+          def allowSuffixProp = project.findProperty("variantSuffixAllowlist")
+          def allowSuffixes = null
+          if (allowSuffixProp != null && allowSuffixProp.toString().trim()) {
+            allowSuffixes = allowSuffixProp.toString().split(",", -1).toList() as Set
+          }
+
           extension.variants.get().each { variant, variantSpec ->
+            if (allowSuffixes != null) {
+              def suf = variantSpec.suffix != null ? variantSpec.suffix : ""
+              if (!allowSuffixes.contains(suf)) {
+                return
+              }
+            }
             if (matrixBuild || variant == extension.defaultVariant.get()) {
                 // Its not easy to merge common buildArgs and variant buildArgs with json format via bake spec.
                 // So, we just add common buildArgs to matrix. variantArgs are added to buildArgs so that variant specific overrides

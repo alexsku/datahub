@@ -1,0 +1,958 @@
+# Security scan → Linear (`security_scan_linear_sync.py`). `security-scan-profiles.core.json` is the default; `security-scan-profiles.saas.json` (if non-empty) replaces it for SaaS — no other workflow fork.
+# Profiles under `.github/security-scan-profiles.*.json` → `.github/security-scan-profiles.resolved.json`.
+# Optional repo vars: Trivy DB mirrors, `TRIVY_CLI_VERSION`; ECR pull-through when `DOCKER_REGISTRY` is private ECR.
+# Grype: `anchore/scan-action/download-grype` + optional `vars.GRYPE_CLI_VERSION`. Results merge with Trivy in `security_scan_linear_sync.py` (CVE × image).
+# `select-runner` (ubuntu-latest) runs registry probe / build-vs-pull. Registry path: `scan-trivy` on `ubuntu-latest`, `scan-grype` on
+# `depot-ubuntu-24.04-4` (same Depot 4x as `scan-and-build-sync` / `docker-unified` / `react-cloudflare-pages`) unless `SECURITY_SCAN_GRYPE_RUNS_ON` overrides;
+# `sync-to-linear` on `ubuntu-latest`. Build path: `scan-and-build-sync` on `depot-ubuntu-24.04-4` (disk cleanup) runs build then Trivy + Grype + sync in one job — local images
+# are not available on other runners, so Trivy/Grype are not split there.
+# Artifacts: image list + Trivy/Grype report uploads use `retention-days: 1` (single-run handoff only; minimum retention).
+# Deduplication: `&` anchors and `*` aliases (GitHub supports anchors; merge keys `<<` are not supported — see
+# <https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/reusing-workflow-configurations#yaml-anchors-and-aliases>).
+
+name: Security scan and Linear sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      docker_tag:
+        description: "Optional image tag to pull/scan. Empty = tag from docker_helpers. Not combinable with skip_registry_probe."
+        required: false
+        type: string
+        default: ""
+      scan_profile:
+        description: "Profile key (see `.github/security-scan-profiles.*.json`)."
+        required: true
+        type: choice
+        default: allImages
+        options:
+          - allImages
+          - javaImages
+          - actionsImages
+      variant_scope:
+        description: "primary = base tag only. all = every suffix in the profile. slim or locked-wolfi = only that suffix; declare it in registry_variant_tag_suffixes. Repos without a match are skipped."
+        required: true
+        type: choice
+        default: all
+        options:
+          - primary
+          - all
+          - slim
+          - locked-wolfi
+      image_name_pattern:
+        description: "grep -E pattern for locally built images (after build step)."
+        required: true
+        type: string
+        default: "acryldata|795586375822"
+      skip_registry_probe:
+        description: "Build images from the workflow ref instead of pulling from the registry."
+        required: true
+        type: boolean
+        default: false
+      scan_with_trivy:
+        description: "Run Trivy on each image and feed JSON into the Linear sync (merged with Grype by CVE per image)."
+        required: true
+        type: boolean
+        default: true
+      scan_with_grype:
+        description: "Run Grype on each image and feed JSON into the Linear sync (merged with Trivy by CVE per image)."
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: security-scan-linear-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  select-runner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DOCKER_REGISTRY: ${{ vars.DOCKER_REGISTRY }}
+    outputs:
+      need_build: ${{ steps.resolve-images.outputs.need_build }}
+      runner: ${{ steps.pick-runner.outputs.runner }}
+      grype_runner: ${{ steps.pick-runner.outputs.grype_runner }}
+      ref_kind: ${{ steps.git-ref.outputs.kind }}
+      ref_name: ${{ steps.git-ref.outputs.name }}
+      ref_sha: ${{ steps.git-ref.outputs.sha }}
+    steps:
+      - &validate_workflow_inputs
+        name: Validate inputs
+        env:
+          EVENT_INPUTS_JSON: ${{ toJSON(github.event.inputs) }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          INPUT_SKIP_REGISTRY_PROBE: ${{ inputs.skip_registry_probe }}
+          INPUT_DOCKER_TAG: ${{ inputs.docker_tag }}
+          INPUT_SCAN_WITH_TRIVY: ${{ inputs.scan_with_trivy }}
+          INPUT_SCAN_WITH_GRYPE: ${{ inputs.scan_with_grype }}
+        run: |
+          set -euo pipefail
+          echo "::group::workflow_dispatch"
+          echo "${EVENT_INPUTS_JSON}"
+          echo "::endgroup::"
+          echo "github.ref_name=${GITHUB_REF_NAME} DOCKER_REGISTRY=${DOCKER_REGISTRY:-<unset>}"
+          if [[ "${INPUT_SKIP_REGISTRY_PROBE}" == "true" && -n "${INPUT_DOCKER_TAG}" ]]; then
+            echo "::error::skip_registry_probe cannot be used with docker_tag"
+            exit 1
+          fi
+          if [[ "${INPUT_SCAN_WITH_TRIVY}" != "true" && "${INPUT_SCAN_WITH_GRYPE}" != "true" ]]; then
+            echo "::error::Enable at least one of scan_with_trivy or scan_with_grype"
+            exit 1
+          fi
+
+      - name: Checkout (minimal)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-tags: ${{ inputs.docker_tag != '' }}
+          sparse-checkout: |
+            .github/security-scan-profiles.core.json
+            .github/scripts/docker_helpers.sh
+            .github/scripts/security_scan_linear_sync.py
+            trivy.yaml
+          sparse-checkout-cone-mode: false
+
+      - &resolve_security_profile_config
+        name: Resolve security scan profile config
+        run: |
+          set -euo pipefail
+          mkdir -p .github
+          git show "HEAD:.github/security-scan-profiles.saas.json" 2>/dev/null > .github/security-scan-profiles.saas.json || echo '{}' > .github/security-scan-profiles.saas.json
+
+          out=".github/security-scan-profiles.resolved.json"
+          if jq -e 'type == "object" and (length > 0)' .github/security-scan-profiles.saas.json >/dev/null 2>&1; then
+            cp .github/security-scan-profiles.saas.json "${out}"
+          else
+            cp .github/security-scan-profiles.core.json "${out}"
+          fi
+
+      - &apply_scan_profile
+        name: Apply scan profile
+        id: scan-profile
+        env:
+          SCAN_PROFILE: ${{ inputs.scan_profile }}
+        run: |
+          set -euo pipefail
+          CFG=".github/security-scan-profiles.resolved.json"
+          SCAN_PROFILE="${SCAN_PROFILE//[[:space:]]/}"
+          if [[ -z "${SCAN_PROFILE}" ]]; then
+            echo "::error::scan_profile is empty"
+            exit 1
+          fi
+          if [[ "${SCAN_PROFILE}" == _* ]]; then
+            echo "::error::Invalid scan_profile: ${SCAN_PROFILE}"
+            exit 1
+          fi
+          if ! jq -e --arg p "${SCAN_PROFILE}" '.[$p] | type == "object"' "${CFG}" >/dev/null; then
+            echo "::error::Unknown or invalid scan_profile: ${SCAN_PROFILE} (see ${CFG})"
+            exit 1
+          fi
+          {
+            echo "gradle_tasks<<GF"
+            jq -r --arg p "${SCAN_PROFILE}" '.[$p].gradle_tasks[]' "${CFG}"
+            echo "GF"
+            echo "registry_repos=$(jq -r --arg p "${SCAN_PROFILE}" '.[$p].registry_repos | join(" ")' "${CFG}")"
+            echo "local_repo_regex=$(jq -r --arg p "${SCAN_PROFILE}" '.[$p].local_repo_regex' "${CFG}")"
+            echo "registry_skip_repos=$(jq -r --arg p "${SCAN_PROFILE}" '.[$p].registry_skip_repos // [] | join(" ")' "${CFG}")"
+          } >> "${GITHUB_OUTPUT}"
+
+      - &resolve_git_ref_linear
+        name: Resolve git ref (Linear)
+        id: git-ref
+        env:
+          GITHUB_REF_FULL: ${{ github.ref }}
+          DOCKER_TAG: ${{ inputs.docker_tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${DOCKER_TAG}" ]]; then
+            tag="${DOCKER_TAG}"
+            if c=$(git rev-parse -q --verify "${tag}^{commit}" 2>/dev/null); then
+              commit="$c"
+              ref_out="refs/tags/${tag}"
+            elif c=$(git rev-parse -q --verify "refs/tags/${tag}^{commit}" 2>/dev/null); then
+              commit="$c"
+              ref_out="refs/tags/${tag}"
+            else
+              commit="$(git rev-parse HEAD)"
+              ref_out="${GITHUB_REF_FULL}"
+              echo "::notice::docker_tag ${tag} not a resolvable git ref; Linear uses SHA ${commit:0:7} and ref ${ref_out}"
+            fi
+            {
+              echo "kind=tag"
+              echo "name=${tag}"
+              echo "github_ref=${ref_out}"
+              echo "sha=${commit}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if tag=$(git describe --tags --exact-match HEAD 2>/dev/null); then
+            { echo "kind=tag"; echo "name=${tag}"; echo "github_ref=refs/tags/${tag}"; } >> "$GITHUB_OUTPUT"
+          elif sym=$(git symbolic-ref -q HEAD); then
+            { echo "kind=branch"; echo "name=${sym#refs/heads/}"; echo "github_ref=${sym}"; } >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Checkout must be a branch or exact tag."
+            exit 1
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - &ecr_login
+        name: Login to Amazon ECR
+        if: ${{ contains(env.DOCKER_REGISTRY, 'amazonaws.com') }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ECR_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_ECR_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          [[ -z "${AWS_SECRET_ACCESS_KEY:-}" ]] && { echo "::notice::ECR secrets unset; private pulls may fail."; exit 0; }
+          reg="${DOCKER_REGISTRY}"
+          [[ "${reg}" =~ \.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com ]] || { echo "::error::Bad DOCKER_REGISTRY for ECR"; exit 1; }
+          export AWS_DEFAULT_REGION="${BASH_REMATCH[1]}"
+          aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" | docker login --username AWS --password-stdin "${reg}"
+
+      - &resolve_images_from_registry
+        name: Resolve images from registry
+        id: resolve-images
+        env:
+          GITHUB_REF: ${{ steps.git-ref.outputs.github_ref }}
+          GITHUB_SHA: ${{ steps.git-ref.outputs.sha }}
+          DOCKER_TAG_INPUT: ${{ inputs.docker_tag }}
+          SCAN_PROFILE: ${{ inputs.scan_profile }}
+          IMAGE_REPOS: ${{ steps.scan-profile.outputs.registry_repos }}
+          REGISTRY_SKIP_REPOS: ${{ steps.scan-profile.outputs.registry_skip_repos }}
+          VARIANT_SCOPE: ${{ inputs.variant_scope }}
+          INPUT_SKIP_REGISTRY_PROBE: ${{ inputs.skip_registry_probe }}
+        run: |
+          set -euo pipefail
+          CFG=".github/security-scan-profiles.resolved.json"
+          SCAN_PROFILE="${SCAN_PROFILE//[[:space:]]/}"
+          export IMAGE_REPOS
+          CANARY_REPO="datahub-gms"
+          REGISTRY_PREFIX="${DOCKER_REGISTRY}"
+          probe() { docker manifest inspect "$1" >/dev/null 2>&1; }
+
+          set_reg_prefix() {
+            if [[ "${REGISTRY_PREFIX}" == *amazonaws.com* ]]; then reg="ecr"; else reg="dockerhub"; fi
+            prefix="${REGISTRY_PREFIX}/"
+          }
+
+          should_skip_repo() {
+            local r="$1"
+            for s in ${REGISTRY_SKIP_REPOS}; do
+              [[ "${r}" == "${s}" ]] && return 0
+            done
+            return 1
+          }
+
+          if [[ -z "${REGISTRY_PREFIX}" ]]; then
+            [[ -n "${DOCKER_TAG_INPUT}" ]] && { echo "::error::DOCKER_REGISTRY required when docker_tag is set"; exit 1; }
+            echo "::notice::DOCKER_REGISTRY unset; will build locally."
+            { echo "need_build=true"; echo "registry_source=none"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "${INPUT_SKIP_REGISTRY_PROBE}" == "true" ]]; then
+            { echo "need_build=true"; echo "registry_source=skipped"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          scan_tag="" reg="" prefix=""
+
+          if [[ -n "${DOCKER_TAG_INPUT}" ]]; then
+            scan_tag="${DOCKER_TAG_INPUT}"
+            set_reg_prefix
+            probe "${REGISTRY_PREFIX}/${CANARY_REPO}:${scan_tag}" || {
+              echo "::error::No manifest ${REGISTRY_PREFIX}/${CANARY_REPO}:${scan_tag}"
+              exit 1
+            }
+          else
+            source .github/scripts/docker_helpers.sh
+            while IFS= read -r t; do
+              [[ -z "${t}" ]] && continue
+              if probe "${REGISTRY_PREFIX}/${CANARY_REPO}:${t}"; then
+                scan_tag="${t}"
+                set_reg_prefix
+                break
+              fi
+            done < <(printf '%s\n' "$(get_unique_tag)" "$(get_tag)" | awk 'NF && !seen[$0]++')
+
+            if [[ -z "${scan_tag}" ]]; then
+              echo "No canary manifest for docker_helpers tags; will build locally."
+              { echo "need_build=true"; echo "registry_source=none"; } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          : > image-list.txt
+          for repo in ${IMAGE_REPOS}; do
+            should_skip_repo "${repo}" && continue
+            mapfile -t _raw_suf < <(jq -r --arg p "${SCAN_PROFILE}" --arg r "${repo}" '(.[$p].registry_variant_tag_suffixes // {})[$r] // [] | .[]' "${CFG}" || true)
+            if [[ "${VARIANT_SCOPE}" == "primary" ]]; then
+              echo "${prefix}${repo}:${scan_tag}" >> image-list.txt
+              continue
+            fi
+            _use=()
+            case "${VARIANT_SCOPE}" in
+              all)
+                _use=("${_raw_suf[@]}")
+                ;;
+              slim)
+                for _s in "${_raw_suf[@]}"; do [[ "${_s}" == "-slim" ]] && _use+=("${_s}"); done
+                ;;
+              locked-wolfi)
+                for _s in "${_raw_suf[@]}"; do [[ "${_s}" == "-locked-wolfi" ]] && _use+=("${_s}"); done
+                ;;
+              *)
+                echo "::error::Invalid VARIANT_SCOPE=${VARIANT_SCOPE}"
+                exit 1
+                ;;
+            esac
+            if [[ ${#_use[@]} -eq 0 ]]; then
+              if [[ "${VARIANT_SCOPE}" == "all" ]]; then
+                echo "${prefix}${repo}:${scan_tag}" >> image-list.txt
+              else
+                echo "::warning::Skip ${repo}: no \"${VARIANT_SCOPE}\" entry in registry_variant_tag_suffixes for profile ${SCAN_PROFILE}."
+              fi
+              continue
+            fi
+            for _suf in "${_use[@]}"; do
+              echo "${prefix}${repo}:${scan_tag}${_suf}" >> image-list.txt
+            done
+          done
+
+          if [[ ! -s image-list.txt ]]; then
+            echo "::error::No images to pull: VARIANT_SCOPE=${VARIANT_SCOPE} but no registry_variant_tag_suffixes matched any repo. Use primary or all, or add the needed suffix per repository in the scan profile JSON."
+            exit 1
+          fi
+          echo "Canary ${CANARY_REPO}:${scan_tag} (${reg}); $(wc -l < image-list.txt) image ref(s)."
+          head -30 image-list.txt
+          { echo "need_build=false"; echo "scan_tag=${scan_tag}"; echo "registry_source=${reg}"; } >> "$GITHUB_OUTPUT"
+
+      - name: Upload image list
+        if: success() && steps.resolve-images.outputs.need_build == 'false'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: security-scan-image-list
+          path: image-list.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Select runner for main job
+        id: pick-runner
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.resolve-images.outputs.need_build }}" == "true" ]]; then
+            echo "runner=depot-ubuntu-24.04-4" >> "$GITHUB_OUTPUT"
+            echo "grype_runner=depot-ubuntu-24.04-4" >> "$GITHUB_OUTPUT"
+            echo "::notice::Local build path: running scan on depot-ubuntu-24.04-4 (disk cleanup in scan job)."
+          else
+            echo "runner=ubuntu-latest" >> "$GITHUB_OUTPUT"
+            echo "::notice::Registry image path: Trivy on ubuntu-latest; Grype on grype_runner output."
+            GRYPE_OVERR="${{ vars.SECURITY_SCAN_GRYPE_RUNS_ON }}"
+            if [[ -n "${GRYPE_OVERR}" ]]; then
+              echo "grype_runner=${GRYPE_OVERR}" >> "$GITHUB_OUTPUT"
+              echo "::notice::Grype runs on: ${GRYPE_OVERR} (SECURITY_SCAN_GRYPE_RUNS_ON)."
+            else
+              # Match Depot 4x runners used elsewhere (e.g. .github/workflows/docker-unified.yml, react-cloudflare-pages.yml).
+              echo "grype_runner=depot-ubuntu-24.04-4" >> "$GITHUB_OUTPUT"
+              echo "::notice::Grype runs on: depot-ubuntu-24.04-4. Override with SECURITY_SCAN_GRYPE_RUNS_ON (e.g. ubuntu-latest for OSS without Depot)."
+            fi
+          fi
+
+  scan-trivy:
+    name: Trivy scan
+    needs: [select-runner]
+    if: needs.select-runner.outputs.need_build == 'false'
+    runs-on: ${{ needs.select-runner.outputs.runner }}
+    timeout-minutes: 300
+    env:
+      DOCKER_REGISTRY: ${{ vars.DOCKER_REGISTRY }}
+    outputs:
+      scan_failures: ${{ steps.trivy.outputs.scan_failures }}
+    steps:
+      - name: Checkout (Trivy config)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-tags: ${{ inputs.docker_tag != '' }}
+          sparse-checkout: |
+            trivy.yaml
+          sparse-checkout-cone-mode: false
+
+      - &download_image_list_artifact
+        name: Download image list
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: security-scan-image-list
+          path: .
+
+      - *ecr_login
+
+      - &trivy_install
+        name: Install Trivy
+        if: inputs.scan_with_trivy
+        uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
+        with:
+          version: ${{ vars.TRIVY_CLI_VERSION || 'v0.70.0' }}
+          cache: true
+
+      - &trivy_vuln_db_key
+        name: Trivy vulnerability DB cache key
+        if: inputs.scan_with_trivy
+        id: trivy-db-cache
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      - &trivy_restore_vuln_cache
+        name: Restore Trivy vulnerability DB cache
+        if: inputs.scan_with_trivy
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-vuln-db-${{ runner.os }}-${{ steps.trivy-db-cache.outputs.week }}
+          restore-keys: |
+            trivy-vuln-db-${{ runner.os }}-
+
+      - &run_trivy
+        name: Run Trivy
+        id: trivy
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ECR_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_ECR_SECRET_ACCESS_KEY }}
+          TRIVY_DB_REPOSITORY_OVERRIDE: ${{ vars.TRIVY_DB_REPOSITORY }}
+          TRIVY_JAVA_DB_REPOSITORY_OVERRIDE: ${{ vars.TRIVY_JAVA_DB_REPOSITORY }}
+          TRIVY_ECR_PTR_PREFIX: ${{ vars.TRIVY_ECR_PTR_PREFIX }}
+          TRIVY_GHCR_ECR_PTR_PREFIX: ${{ vars.TRIVY_GHCR_ECR_PTR_PREFIX }}
+          SCAN_WITH_TRIVY: ${{ inputs.scan_with_trivy }}
+        run: |
+          set -euo pipefail
+          mkdir -p scan-reports/trivy
+          if [[ "${SCAN_WITH_TRIVY}" != "true" ]]; then
+            echo "::notice::Trivy disabled (scan_with_trivy=false); skipping"
+            echo "scan_failures=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PTR_PREFIX="${TRIVY_ECR_PTR_PREFIX:-public-ecr-aws}"
+          GHCR_PT="${TRIVY_GHCR_ECR_PTR_PREFIX:-ghcr}"
+          PUB_DB="public.ecr.aws/aquasecurity/trivy-db:2"
+          PUB_DB_FALL="ghcr.io/aquasecurity/trivy-db:2"
+          PUB_JDB="public.ecr.aws/aquasecurity/trivy-java-db:1"
+          PUB_JDB_FALL="ghcr.io/aquasecurity/trivy-java-db:1"
+          if [[ -n "${TRIVY_DB_REPOSITORY_OVERRIDE:-}" ]]; then
+            export TRIVY_DB_REPOSITORY="${TRIVY_DB_REPOSITORY_OVERRIDE}"
+          elif [[ -n "${DOCKER_REGISTRY:-}" ]] && [[ "${DOCKER_REGISTRY}" == *dkr.ecr.*.amazonaws.com* ]]; then
+            PTR_DB="${DOCKER_REGISTRY}/${PTR_PREFIX}/aquasecurity/trivy-db:2"
+            PTR_GHCR_DB="${DOCKER_REGISTRY}/${GHCR_PT}/aquasecurity/trivy-db:2"
+            echo "::notice::Trivy DB: ECR pull-through (Public ECR then GHCR), then direct public mirrors."
+            export TRIVY_DB_REPOSITORY="${PTR_DB},${PTR_GHCR_DB},${PUB_DB},${PUB_DB_FALL}"
+          else
+            export TRIVY_DB_REPOSITORY="${PUB_DB},${PUB_DB_FALL}"
+          fi
+          if [[ -n "${TRIVY_JAVA_DB_REPOSITORY_OVERRIDE:-}" ]]; then
+            export TRIVY_JAVA_DB_REPOSITORY="${TRIVY_JAVA_DB_REPOSITORY_OVERRIDE}"
+          elif [[ -n "${DOCKER_REGISTRY:-}" ]] && [[ "${DOCKER_REGISTRY}" == *dkr.ecr.*.amazonaws.com* ]]; then
+            PTR_JDB="${DOCKER_REGISTRY}/${PTR_PREFIX}/aquasecurity/trivy-java-db:1"
+            PTR_GHCR_JDB="${DOCKER_REGISTRY}/${GHCR_PT}/aquasecurity/trivy-java-db:1"
+            export TRIVY_JAVA_DB_REPOSITORY="${PTR_JDB},${PTR_GHCR_JDB},${PUB_JDB},${PUB_JDB_FALL}"
+          else
+            export TRIVY_JAVA_DB_REPOSITORY="${PUB_JDB},${PUB_JDB_FALL}"
+          fi
+          # Parallel trivy processes share ~/.cache/trivy and hit DB/cache lock timeouts; prefetch once then scan serially.
+          echo "::group::Trivy: prefetch vulnerability DBs"
+          trivy image --download-db-only
+          trivy image --download-java-db-only
+          echo "::endgroup::"
+          idx=0 fail_count=0
+          while IFS= read -r img; do
+            [[ -z "${img}" ]] && continue
+            out="scan-reports/trivy/report-${idx}.json"
+            if trivy image \
+              --config trivy.yaml \
+              --ignore-unfixed \
+              --scanners vuln \
+              --pkg-types os,library \
+              --severity HIGH,CRITICAL \
+              --skip-db-update \
+              --skip-java-db-update \
+              --format json \
+              --output "${out}" \
+              "${img}"; then
+              :
+            else
+              fail_count=$((fail_count + 1))
+            fi
+            idx=$((idx + 1))
+          done < image-list.txt
+          ls -la scan-reports/trivy/
+          echo "scan_failures=${fail_count}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Trivy reports
+        if: always() && inputs.scan_with_trivy
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: security-scan-trivy-reports
+          path: scan-reports/trivy
+          if-no-files-found: warn
+          retention-days: 1
+
+  scan-grype:
+    name: Grype scan
+    needs: [select-runner]
+    if: needs.select-runner.outputs.need_build == 'false'
+    runs-on: ${{ needs.select-runner.outputs.grype_runner }}
+    timeout-minutes: 300
+    env:
+      DOCKER_REGISTRY: ${{ vars.DOCKER_REGISTRY }}
+    outputs:
+      scan_failures: ${{ steps.grype.outputs.scan_failures }}
+    steps:
+      - *download_image_list_artifact
+
+      - *ecr_login
+
+      - &grype_install
+        name: Install Grype
+        id: grype-install
+        if: inputs.scan_with_grype
+        uses: anchore/scan-action/download-grype@v7.4.0
+        with:
+          grype-version: ${{ vars.GRYPE_CLI_VERSION || 'v0.86.1' }}
+
+      - &run_grype
+        name: Run Grype
+        id: grype
+        env:
+          SCAN_WITH_GRYPE: ${{ inputs.scan_with_grype }}
+          GRYPE_CMD: ${{ steps.grype-install.outputs.cmd }}
+        run: |
+          set -euo pipefail
+          mkdir -p scan-reports/grype
+          if [[ "${SCAN_WITH_GRYPE}" != "true" ]]; then
+            echo "::notice::Grype disabled (scan_with_grype=false); skipping"
+            echo "scan_failures=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          G="${GRYPE_CMD}"
+          if [[ -z "${G}" ]]; then
+            echo "::error::Grype binary path empty (install step output)"
+            exit 1
+          fi
+          idx=0 fail_count=0
+          while IFS= read -r img; do
+            [[ -z "${img}" ]] && continue
+            out="scan-reports/grype/report-${idx}.json"
+            # Redirect instead of --file (avoids rare JSON credential-sanitization issues with some Grype versions).
+            if "${G}" "${img}" -o json --only-fixed --by-cve > "${out}"; then
+              :
+            else
+              fail_count=$((fail_count + 1))
+            fi
+            idx=$((idx + 1))
+          done < image-list.txt
+          ls -la scan-reports/grype/
+          echo "scan_failures=${fail_count}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Grype reports
+        if: always() && inputs.scan_with_grype
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: security-scan-grype-reports
+          path: scan-reports/grype
+          if-no-files-found: warn
+          retention-days: 1
+
+  sync-to-linear:
+    name: Linear sync (registry path)
+    needs: [select-runner, scan-trivy, scan-grype]
+    if: |
+      !cancelled() && needs.select-runner.result == 'success' &&
+      needs.select-runner.outputs.need_build == 'false' &&
+      needs.scan-trivy.result == 'success' &&
+      needs.scan-grype.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DOCKER_REGISTRY: ${{ vars.DOCKER_REGISTRY }}
+    steps:
+      - name: Checkout (sync script)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-tags: ${{ inputs.docker_tag != '' }}
+          sparse-checkout: |
+            .github/scripts/security_scan_linear_sync.py
+          sparse-checkout-cone-mode: false
+
+      - name: Ensure report directories
+        run: |
+          set -euo pipefail
+          mkdir -p scan-reports/trivy scan-reports/grype
+
+      - name: Download Trivy report artifact
+        if: inputs.scan_with_trivy
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: security-scan-trivy-reports
+          path: scan-reports/trivy
+
+      - name: Download Grype report artifact
+        if: inputs.scan_with_grype
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: security-scan-grype-reports
+          path: scan-reports/grype
+
+      - name: Sync to Linear
+        env:
+          LINEAR_SECURITY_SCAN_API_KEY: ${{ secrets.LINEAR_SECURITY_SCAN_API_KEY }}
+          SCANNER: trivy_grype
+          LINEAR_TEAM_ID: ${{ vars.LINEAR_TEAM_ID || '18ea98cd-cf5f-4296-a16d-b16426c70307' }}
+          # Optional workflow-state UUID for new issues; if unset and triage is enabled for the team,
+          # the script sets stateId to Team.triageIssueState (integrations/non-members triage inbox).
+          LINEAR_ISSUE_STATE_ID: ${{ vars.LINEAR_ISSUE_STATE_ID }}
+          LINEAR_LABEL_IDS: ${{ vars.LINEAR_LABEL_IDS || '623bed97-f0a8-47aa-b673-2f533251f096' }}
+          SCAN_REF_KIND: ${{ needs.select-runner.outputs.ref_kind }}
+          SCAN_REF_NAME: ${{ needs.select-runner.outputs.ref_name }}
+          GITHUB_SHA: ${{ needs.select-runner.outputs.ref_sha }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          SCAN_WITH_TRIVY: ${{ inputs.scan_with_trivy }}
+          SCAN_WITH_GRYPE: ${{ inputs.scan_with_grype }}
+        run: &sync_to_linear_run |
+          set -euo pipefail
+          if [[ -z "${LINEAR_SECURITY_SCAN_API_KEY:-}" ]]; then
+            echo "::error::Missing GitHub Actions secret LINEAR_SECURITY_SCAN_API_KEY (empty or unset). Add it under Settings → Secrets and variables → Actions. For organization secrets, open the secret and add this repository to \"Repository access\"."
+            exit 1
+          fi
+          shopt -s nullglob
+          files=()
+          if [[ "${SCAN_WITH_TRIVY}" == "true" ]]; then
+            for f in scan-reports/trivy/*.json; do
+              [[ -f "${f}" ]] && files+=("${f}")
+            done
+          fi
+          if [[ "${SCAN_WITH_GRYPE}" == "true" ]]; then
+            for f in scan-reports/grype/*.json; do
+              [[ -f "${f}" ]] && files+=("${f}")
+            done
+          fi
+          [[ ${#files[@]} -gt 0 ]] || { echo "::error::No scan JSON reports (check enabled scanners and image list)"; exit 1; }
+          python3 .github/scripts/security_scan_linear_sync.py --scanner trivy_grype "${files[@]}"
+
+      - name: Fail on scanner errors
+        if: ${{ (inputs.scan_with_trivy == 'true' && (needs['scan-trivy'].outputs.scan_failures != '0')) || (inputs.scan_with_grype == 'true' && (needs['scan-grype'].outputs.scan_failures != '0')) }}
+        run: |
+          echo "::error::Trivy failed: ${{ needs['scan-trivy'].outputs.scan_failures }} | Grype failed: ${{ needs['scan-grype'].outputs.scan_failures }}"
+          exit 1
+
+  scan-and-build-sync:
+    needs: [select-runner]
+    if: needs.select-runner.outputs.need_build == 'true'
+    runs-on: ${{ needs.select-runner.outputs.runner }}
+    timeout-minutes: 360
+    env:
+      DOCKER_REGISTRY: ${{ vars.DOCKER_REGISTRY }}
+    steps:
+      - *validate_workflow_inputs
+
+      - name: Checkout (minimal)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-tags: ${{ inputs.docker_tag != '' }}
+          sparse-checkout: |
+            .github/security-scan-profiles.core.json
+            .github/scripts/docker_helpers.sh
+            .github/scripts/security_scan_linear_sync.py
+            .github/actions/free-disk-space/action.yml
+            trivy.yaml
+          sparse-checkout-cone-mode: false
+
+      - name: Disk check (before cleanup, local build)
+        if: ${{ needs.select-runner.outputs.need_build == 'true' }}
+        run: df -h . && docker images
+
+      - name: Free up disk space
+        if: ${{ needs.select-runner.outputs.need_build == 'true' }}
+        uses: ./.github/actions/free-disk-space
+
+      - name: Disk check (after cleanup, local build)
+        if: ${{ needs.select-runner.outputs.need_build == 'true' }}
+        run: df -h . && docker images
+
+      - *resolve_security_profile_config
+
+      - *apply_scan_profile
+
+      - *resolve_git_ref_linear
+
+      - *ecr_login
+
+      - *resolve_images_from_registry
+
+      - name: Checkout (full, for local build)
+        if: ${{ steps.resolve-images.outputs.need_build == 'true' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          # default clean would delete untracked `.github/security-scan-profiles.resolved.json` from the resolve step
+          clean: false
+
+      # First step uses sparse-checkout; the follow-up checkout does not always repopulate every path.
+      # Without this, `./gradlew` can be missing ("No such file or directory") even after the full checkout.
+      - name: Materialize full tree for Gradle (undo sparse-checkout)
+        if: steps.resolve-images.outputs.need_build == 'true'
+        run: |
+          set -euo pipefail
+          git sparse-checkout disable || true
+          git checkout HEAD -- .
+          test -f ./gradlew
+
+      # Borrow from docker-unified.yml (same keys/paths): read-only — restore only, never save uv/yarn/~/.gradle buckets here.
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: steps.resolve-images.outputs.need_build == 'true'
+        with:
+          path: ~/.cache/uv
+          key: docker-unified-${{ runner.os }}-uv-${{ hashFiles(
+            './datahub-actions/pyproject.toml',
+            './datahub-actions/setup.py',
+            './smoke-test/requirements.txt',
+            './smoke-test/pyproject.toml',
+            './metadata-integration/java/spark-lineage-legacy/spark-smoke-test/requirements.txt',
+            './datahub-integrations-service/requirements.txt',
+            './datahub-integrations-service/pyproject.toml',
+            './datahub-executor/requirements.txt',
+            './datahub-executor/pyproject.toml') }}
+          restore-keys: |
+            docker-unified-${{ runner.os }}-uv-
+
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: steps.resolve-images.outputs.need_build == 'true'
+        with:
+          path: ~/.cache/yarn
+          key: docker-unified-${{ runner.os }}-yarn-${{ hashFiles('./smoke-test/tests/cypress/yarn.lock', './datahub-web-react/yarn.lock') }}
+          restore-keys: |
+            docker-unified-${{ runner.os }}-yarn-
+
+      # ~/.gradle paths + gradle-plugins-cache — shared bucket with docker-unified base_build; do not cache/save from this workflow.
+      - name: Restore Gradle plugins cache (docker-unified bucket)
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: steps.resolve-images.outputs.need_build == 'true'
+        with:
+          path: |
+            ~/.gradle/wrapper
+            ~/.gradle/caches/modules-2
+            ~/.gradle/caches/jars-*
+            ~/.gradle/caches/transforms-*
+          key: gradle-plugins-cache
+          restore-keys: |
+            gradle-plugins-cache
+
+      - name: Set up JDK 21
+        if: steps.resolve-images.outputs.need_build == 'true'
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
+        with:
+          distribution: "zulu"
+          java-version: 21
+
+      - name: Set up Gradle
+        if: steps.resolve-images.outputs.need_build == 'true'
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+
+      - name: Build Docker images
+        id: build-images
+        if: steps.resolve-images.outputs.need_build == 'true'
+        env:
+          GITHUB_REF: ${{ steps.git-ref.outputs.github_ref }}
+          GITHUB_SHA: ${{ steps.git-ref.outputs.sha }}
+          GRADLE_TASKS: ${{ steps.scan-profile.outputs.gradle_tasks }}
+          VARIANT_SCOPE: ${{ inputs.variant_scope }}
+          SCAN_PROFILE: ${{ inputs.scan_profile }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/docker_helpers.sh
+          TAG="$(get_tag)" SHORT="$(get_short_sha)" PY="$(get_python_docker_release_v)"
+          CFG=".github/security-scan-profiles.resolved.json"
+          SP="${SCAN_PROFILE//[[:space:]]/}"
+          # variant_scope → Wolfi, matrix (bake) vs single default variant, executor/actions variant keys
+          # (see gradle/docker/docker.gradle generateBakeSnippet, datahub-executor datahubExecutorVariant, datahub-actions datahubActionsVariant)
+          case "${VARIANT_SCOPE}" in
+            primary)
+              INCLUDE_WOLFI=false
+              MB_VAL="false"
+              EV="full"
+              AV="full"
+              ;;
+            slim)
+              INCLUDE_WOLFI=false
+              MB_VAL="false"
+              EV="slim"
+              AV="slim"
+              ;;
+            locked-wolfi)
+              INCLUDE_WOLFI=true
+              MB_VAL="false"
+              EV="locked-wolfi"
+              AV="locked"
+              ;;
+            all)
+              INCLUDE_WOLFI=true
+              MB_VAL="true"
+              EV="full"
+              AV="full"
+              ;;
+            *)
+              echo "::error::Invalid VARIANT_SCOPE=${VARIANT_SCOPE}"
+              exit 1
+              ;;
+          esac
+          if [[ "${INCLUDE_WOLFI}" == "true" ]]; then
+            WOLFI_FLAG=(-PincludeWolfiVariants=true)
+          else
+            WOLFI_FLAG=(-PincludeWolfiVariants=false)
+          fi
+          ALLOW_PROPS=()
+          if [[ "${VARIANT_SCOPE}" == "all" && -f "${CFG}" && -n "${SP}" ]]; then
+            if ALLOW=$(jq -r --arg p "${SP}" '[.[$p].registry_variant_tag_suffixes // {} | .[] | .[]?] | unique | join(",")' "${CFG}" 2>/dev/null) && [[ -n "${ALLOW}" ]]; then
+              ALLOW_PROPS=(-PvariantSuffixAllowlist="${ALLOW}")
+            fi
+          fi
+          # Default matrix bake uses linux/amd64 and linux/arm64; GHA hosted runners are amd64 — build one arch to save time.
+          COMMON=(
+            --no-daemon "-PmatrixBuild=${MB_VAL}"
+            "-Ptag=${TAG}" "-PshaTag=${SHORT}" "-PpythonDockerVersion=${PY}"
+            "-PdockerRegistry=${DOCKER_REGISTRY}"
+            -PdockerBuildPlatforms=linux/amd64
+            "${WOLFI_FLAG[@]}" -PincludeDistrolessVariants=false
+            "-PdatahubExecutorVariant=${EV}" "-PdatahubActionsVariant=${AV}"
+            "${ALLOW_PROPS[@]}"
+          )
+          TASKS=()
+          while IFS= read -r line; do
+            [[ -z "${line// }" ]] && continue
+            TASKS+=("${line}")
+          done <<< "${GRADLE_TASKS}"
+          echo "Gradle tag=${TAG} shaTag=${SHORT} tasks=${TASKS[*]}"
+          set +e
+          ./gradlew --continue "${COMMON[@]}" "${TASKS[@]}"
+          gradle_exit=$?
+          set -e
+          fail=0
+          [[ "${gradle_exit}" -ne 0 ]] && { echo "::warning::Gradle exit ${gradle_exit}"; fail=1; }
+          echo "build_group_failures=${fail}" >> "$GITHUB_OUTPUT"
+
+      - name: List local images to scan
+        if: steps.resolve-images.outputs.need_build == 'true'
+        env:
+          LOCAL_REPO_REGEX: ${{ steps.scan-profile.outputs.local_repo_regex }}
+          VARIANT_SCOPE: ${{ inputs.variant_scope }}
+          SCAN_PROFILE: ${{ inputs.scan_profile }}
+          IMAGE_NAME_PATTERN: ${{ inputs.image_name_pattern }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/docker_helpers.sh
+          TAG="$(get_tag)"
+          CFG=".github/security-scan-profiles.resolved.json"
+          SCAN_PROFILE="${SCAN_PROFILE//[[:space:]]/}"
+
+          : > candidates.txt
+          docker images --format '{{.Repository}}:{{.Tag}}' \
+            | grep -Ev '<none>' \
+            | grep -E "${IMAGE_NAME_PATTERN}" \
+            | grep -E "${LOCAL_REPO_REGEX}" \
+            | sort -u > candidates.txt || true
+
+          : > image-list.txt
+          while IFS= read -r line; do
+            [[ -z "${line}" ]] && continue
+            tag="${line##*:}"
+            repo_full="${line%:*}"
+            repo_short="${repo_full##*/}"
+            match=false
+            mapfile -t _raw_suf < <(jq -r --arg p "${SCAN_PROFILE}" --arg r "${repo_short}" '(.[$p].registry_variant_tag_suffixes // {})[$r] // [] | .[]' "${CFG}" || true)
+            if [[ "${VARIANT_SCOPE}" == "primary" ]]; then
+              [[ "${tag}" == "${TAG}" ]] && match=true
+            else
+              _use=()
+              case "${VARIANT_SCOPE}" in
+                all)
+                  _use=("${_raw_suf[@]}")
+                  ;;
+                slim)
+                  for _s in "${_raw_suf[@]}"; do [[ "${_s}" == "-slim" ]] && _use+=("${_s}"); done
+                  ;;
+                locked-wolfi)
+                  for _s in "${_raw_suf[@]}"; do [[ "${_s}" == "-locked-wolfi" ]] && _use+=("${_s}"); done
+                  ;;
+                *)
+                  echo "::error::Invalid VARIANT_SCOPE=${VARIANT_SCOPE}"
+                  exit 1
+                  ;;
+              esac
+              if [[ ${#_use[@]} -eq 0 ]]; then
+                if [[ "${VARIANT_SCOPE}" == "all" ]]; then
+                  [[ "${tag}" == "${TAG}" ]] && match=true
+                fi
+              else
+                for _suf in "${_use[@]}"; do
+                  [[ "${tag}" == "${TAG}${_suf}" ]] && match=true && break
+                done
+              fi
+            fi
+            [[ "${match}" == "true" ]] && echo "${line}" >> image-list.txt
+          done < candidates.txt
+
+          [[ -s image-list.txt ]] || { echo "::error::No images matched after build (TAG=${TAG}; adjust registry_variant_tag_suffixes or image_name_pattern)"; docker images; exit 1; }
+          echo "Matched $(wc -l < image-list.txt) image(s) for TAG=${TAG}"
+          head -40 image-list.txt
+
+      # Pinned version enables setup-trivy binary cache; override via repo var `TRIVY_CLI_VERSION`.
+      - *trivy_install
+
+      - *trivy_vuln_db_key
+
+      # Separate from docker-unified borrow: this workflow may save/update the Trivy DB cache (weekly key).
+      - *trivy_restore_vuln_cache
+
+      - *run_trivy
+
+      - *grype_install
+
+      - *run_grype
+
+      - name: Sync to Linear
+        env:
+          LINEAR_SECURITY_SCAN_API_KEY: ${{ secrets.LINEAR_SECURITY_SCAN_API_KEY }}
+          SCANNER: trivy_grype
+          LINEAR_TEAM_ID: ${{ vars.LINEAR_TEAM_ID || '18ea98cd-cf5f-4296-a16d-b16426c70307' }}
+          # Optional workflow-state UUID for new issues; if unset and triage is enabled for the team,
+          # the script sets stateId to Team.triageIssueState (integrations/non-members triage inbox).
+          LINEAR_ISSUE_STATE_ID: ${{ vars.LINEAR_ISSUE_STATE_ID }}
+          LINEAR_LABEL_IDS: ${{ vars.LINEAR_LABEL_IDS || '623bed97-f0a8-47aa-b673-2f533251f096' }}
+          SCAN_REF_KIND: ${{ steps.git-ref.outputs.kind }}
+          SCAN_REF_NAME: ${{ steps.git-ref.outputs.name }}
+          GITHUB_SHA: ${{ steps.git-ref.outputs.sha }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          SCAN_WITH_TRIVY: ${{ inputs.scan_with_trivy }}
+          SCAN_WITH_GRYPE: ${{ inputs.scan_with_grype }}
+        run: *sync_to_linear_run
+
+      - name: Fail on scanner errors
+        if: ${{ steps.trivy.outputs.scan_failures != '0' || steps.grype.outputs.scan_failures != '0' }}
+        run: |
+          echo "::error::Trivy failed: ${{ steps.trivy.outputs.scan_failures }} | Grype failed: ${{ steps.grype.outputs.scan_failures }}"
+          exit 1
+
+      - name: Fail on Gradle partial failure
+        if: ${{ steps.build-images.conclusion == 'success' && steps.build-images.outputs.build_group_failures != '0' }}
+        run: |
+          echo "::error::Gradle build group(s) failed"
+          exit 1

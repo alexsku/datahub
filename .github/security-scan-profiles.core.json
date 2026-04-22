@@ -1,0 +1,42 @@
+{
+  "_meta": {
+    "config_split": "Default security scan profiles for repositories without an optional extended profile file."
+  },
+  "allImages": {
+    "gradle_tasks": [":docker:buildImagesallImages"],
+    "registry_repos": [
+      "datahub-gms",
+      "datahub-frontend-react",
+      "datahub-mce-consumer",
+      "datahub-mae-consumer",
+      "datahub-upgrade",
+      "datahub-actions"
+    ],
+    "local_repo_regex": "(datahub-gms|datahub-frontend-react|datahub-mce-consumer|datahub-mae-consumer|datahub-upgrade|datahub-actions)",
+    "registry_skip_repos": ["datahub-ingestion"],
+    "registry_variant_tag_suffixes": {
+      "datahub-actions": ["", "-slim", "-locked"]
+    }
+  },
+  "javaImages": {
+    "gradle_tasks": [":docker:buildImagesallImages"],
+    "registry_repos": [
+      "datahub-gms",
+      "datahub-frontend-react",
+      "datahub-mce-consumer",
+      "datahub-mae-consumer",
+      "datahub-upgrade"
+    ],
+    "local_repo_regex": "(datahub-gms|datahub-frontend-react|datahub-mce-consumer|datahub-mae-consumer|datahub-upgrade)",
+    "registry_skip_repos": ["datahub-ingestion"]
+  },
+  "actionsImages": {
+    "gradle_tasks": [":docker:buildImagesactionsImages"],
+    "registry_repos": ["datahub-actions"],
+    "local_repo_regex": "datahub-actions",
+    "registry_skip_repos": ["datahub-ingestion"],
+    "registry_variant_tag_suffixes": {
+      "datahub-actions": ["", "-slim", "-locked"]
+    }
+  }
+}

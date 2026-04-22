@@ -100,6 +100,7 @@ ext {
             captureContainersOutputToFiles: project.file('build/container-logs')
     ]
 
+    // `actionsImages` (before `allImages`) is used by the security scan workflow for a targeted :datahub-actions bake.
     // declarative task configuration
     quickstart_configs = [
             'quickstart': [
@@ -237,6 +238,12 @@ ext {
                 additionalEnv: [
                         DATAHUB_LOCAL_ACTIONS_ENV: "${rootProject.project(':smoke-test').projectDir}/test_resources/actions/actions.env"
                 ]
+            ],
+            'actionsImages': [
+                    profile: 'quickstart-consumers',
+                    modules: [
+                            ':datahub-actions',
+                    ]
             ],
             'allImages': [ //This is a special task just to include all images as dependencies - and is useful when CI needs to publish all images
                     profile: 'quickstart-consumers',
